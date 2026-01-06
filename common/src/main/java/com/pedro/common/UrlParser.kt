@@ -48,8 +48,8 @@ class UrlParser private constructor(
     port = if (uri.port < 0) null else uri.port
     path = uri.path.removePrefix("/")
     if (uri.query != null) {
-      val i = url.indexOf(uri.query)
-      query = url.substring(if (i < 0) 0 else i)
+      val i = url.indexOf("?")
+      query = url.substring(i + 1)
     }
     auth = uri.userInfo
   }
