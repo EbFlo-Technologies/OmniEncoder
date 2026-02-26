@@ -45,7 +45,18 @@ public class AndroidMuxerRecordController extends BaseRecordController {
   private MediaMuxer mediaMuxer;
   private MediaFormat videoFormat, audioFormat;
   private final int outputFormat = MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4;
+    private int orientationHint = 0;
 
+    /**
+     * Set the orientation hint for the output video file.
+     * This allows the video to be played back with the correct orientation
+     * (e.g., Portrait) even if the encoded frames are Landscape.
+     *
+     * @param orientationHint The rotation in degrees (0, 90, 180, 270).
+     */
+    public void setOrientationHint(int orientationHint) {
+        this.orientationHint = orientationHint;
+    }
   @Override
   public void startRecord(@NonNull String path, @Nullable Listener listener, RecordTracks tracks) throws IOException {
     this.tracks = tracks;
@@ -53,6 +64,7 @@ public class AndroidMuxerRecordController extends BaseRecordController {
       throw new IOException("Unsupported AudioCodec: " + audioCodec.name());
     }
     mediaMuxer = new MediaMuxer(path, outputFormat);
+    mediaMuxer.setOrientationHint(orientationHint);
     this.listener = listener;
     status = Status.STARTED;
     if (listener != null) {
