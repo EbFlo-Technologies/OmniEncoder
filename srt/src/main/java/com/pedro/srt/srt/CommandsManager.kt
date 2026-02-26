@@ -43,158 +43,147 @@ import kotlin.random.Random
  */
 class CommandsManager {
 
-    private val TAG = "CommandsManager"
+  private val TAG = "CommandsManager"
+  //used for packet lost
+  private val packetHandlingQueue = mutableListOf<DataPacket>()
 
-    //used for packet lost
-    private val packetHandlingQueue = mutableListOf<DataPacket>()
+  var sequenceNumber: Int = generateInitialSequence()
+  var messageNumber = 1
+  var MTU = Constants.MTU
+  var socketId = 0
+  var startTS = 0L //microSeconds
+  var audioDisabled = false
+  var videoDisabled = false
+  var host = ""
+  //Avoid write a packet in middle of other.
+  private val writeSync = Mutex(locked = false)
+  private var encryptor: EncryptionUtil? = null
+  var videoCodec = VideoCodec.H264
+  var audioCodec = AudioCodec.AAC
 
-    val stats = SrtStats()
+  fun setPassphrase(passphrase: String, type: EncryptionType) {
+    encryptor = if (passphrase.isEmpty() || type == EncryptionType.NONE) null else EncryptionUtil(type, passphrase)
+  }
 
-    var sequenceNumber: Int = generateInitialSequence()
-    var messageNumber = 1
-    var MTU = Constants.MTU
-    var socketId = 0
-    var startTS = 0L //microSeconds
-    var audioDisabled = false
-    var videoDisabled = false
-    var host = ""
+  fun getEncryptInfo(): EncryptInfo? {
+    return encryptor?.getEncryptInfo()
+  }
 
-    //Avoid write a packet in middle of other.
-    private val writeSync = Mutex(locked = false)
-    private var encryptor: EncryptionUtil? = null
-    var videoCodec = VideoCodec.H264
-    var audioCodec = AudioCodec.AAC
+  fun getEncryptType(): EncryptionType {
+    return encryptor?.type ?: EncryptionType.NONE
+  }
 
-    fun setPassphrase(passphrase: String, type: EncryptionType) {
-        encryptor =
-            if (passphrase.isEmpty() || type == EncryptionType.NONE) null else EncryptionUtil(
-                type,
-                passphrase
-            )
+  fun encryptionEnabled() = encryptor != null
+
+  fun loadStartTs() {
+    startTS = TimeUtils.getCurrentTimeMicro()
+  }
+
+  fun getTs(): Int {
+    return (TimeUtils.getCurrentTimeMicro() - startTS).toInt()
+  }
+
+  @Throws(IOException::class)
+  suspend fun writeHandshake(socket: SrtSocket?, handshake: Handshake = Handshake()) {
+    writeSync.withLock {
+      handshake.initialPacketSequence = sequenceNumber
+      handshake.ipAddress = host
+      handshake.write(getTs(), 0)
+      Log.i(TAG, handshake.toString())
+      socket?.write(handshake)
     }
+  }
 
-    fun getEncryptInfo(): EncryptInfo? {
-        return encryptor?.getEncryptInfo()
+  @Throws(IOException::class)
+  suspend fun readHandshake(socket: SrtSocket?): Handshake {
+    val handshakeBuffer = socket?.readBuffer() ?: throw IOException("read buffer failed, socket disconnected")
+    val handshake = SrtPacket.getSrtPacket(handshakeBuffer)
+    if (handshake is Handshake) {
+      Log.i(TAG, handshake.toString())
+      return handshake
+    } else {
+      throw IOException("unexpected response type: ${handshake.javaClass.name}")
     }
+  }
 
-    fun getEncryptType(): EncryptionType {
-        return encryptor?.type ?: EncryptionType.NONE
+  @Throws(IOException::class)
+  suspend fun writeData(packet: MpegTsPacket, socket: SrtSocket?): Int {
+    writeSync.withLock {
+      if (sequenceNumber.toUInt() > 0x7FFFFFFFu) sequenceNumber = 0
+      val dataPacket = DataPacket(
+        encryption = if (encryptor != null) KeyBasedEncryption.PAIR_KEY else KeyBasedEncryption.NONE,
+        sequenceNumber = sequenceNumber,
+        packetPosition = packet.packetPosition,
+        messageNumber = messageNumber++,
+        payload = encryptor?.encrypt(packet.buffer, sequenceNumber) ?: packet.buffer,
+        ts = getTs(),
+        socketId = socketId
+      )
+      sequenceNumber++
+      packetHandlingQueue.add(dataPacket)
+      dataPacket.write()
+      socket?.write(dataPacket)
+      return dataPacket.getSize()
     }
+  }
 
-    fun loadStartTs() {
-        startTS = TimeUtils.getCurrentTimeMicro()
+  @Throws(IOException::class)
+  suspend fun reSendPackets(packetsLost: List<Int>, socket: SrtSocket?) {
+    writeSync.withLock {
+      val dataPackets = packetHandlingQueue.filter { packetsLost.contains(it.sequenceNumber) }
+      dataPackets.forEach { packet ->
+        packet.messageNumber = messageNumber++
+        packet.retransmitted = true
+        packet.write()
+        socket?.write(packet)
+      }
     }
+  }
 
-    fun getTs(): Int {
-        return (TimeUtils.getCurrentTimeMicro() - startTS).toInt()
+  suspend fun updateHandlingQueue(lastPacketSequence: Int) {
+    writeSync.withLock {
+      packetHandlingQueue.removeAll { it.sequenceNumber < lastPacketSequence }
     }
+  }
 
-    @Throws(IOException::class)
-    suspend fun writeHandshake(socket: SrtSocket?, handshake: Handshake = Handshake()) {
-        writeSync.withLock {
-            handshake.initialPacketSequence = sequenceNumber
-            handshake.ipAddress = host
-            handshake.write(getTs(), 0)
-            Log.i(TAG, handshake.toString())
-            socket?.write(handshake)
-        }
+  @Throws(IOException::class)
+  suspend fun writeAck2(ackSequence: Int, socket: SrtSocket?) {
+    writeSync.withLock {
+      val ack2 = Ack2(ackSequence)
+      ack2.write(getTs(), socketId)
+      socket?.write(ack2)
     }
+  }
 
-    @Throws(IOException::class)
-    suspend fun readHandshake(socket: SrtSocket?): Handshake {
-        val handshakeBuffer =
-            socket?.readBuffer() ?: throw IOException("read buffer failed, socket disconnected")
-        val handshake = SrtPacket.getSrtPacket(handshakeBuffer)
-        if (handshake is Handshake) {
-            Log.i(TAG, handshake.toString())
-            return handshake
-        } else {
-            throw IOException("unexpected response type: ${handshake.javaClass.name}")
-        }
+  @Throws(IOException::class)
+  suspend fun writeShutdown(socket: SrtSocket?) {
+    writeSync.withLock {
+      val shutdown = Shutdown()
+      shutdown.write(getTs(), socketId)
+      socket?.write(shutdown)
     }
+  }
 
-    @Throws(IOException::class)
-    suspend fun writeData(packet: MpegTsPacket, socket: SrtSocket?): Int {
-        writeSync.withLock {
-            if (sequenceNumber.toUInt() > 0x7FFFFFFFu) sequenceNumber = 0
-            val dataPacket = DataPacket(
-                encryption = if (encryptor != null) KeyBasedEncryption.PAIR_KEY else KeyBasedEncryption.NONE,
-                sequenceNumber = sequenceNumber,
-                packetPosition = packet.packetPosition,
-                messageNumber = messageNumber++,
-                payload = encryptor?.encrypt(packet.buffer, sequenceNumber) ?: packet.buffer,
-                ts = getTs(),
-                socketId = socketId
-            )
-            sequenceNumber++
-            packetHandlingQueue.add(dataPacket)
-            dataPacket.write()
-            socket?.write(dataPacket)
-            return dataPacket.getSize()
-        }
+  @Throws(IOException::class)
+  suspend fun writeKeepAlive(socket: SrtSocket?) {
+    writeSync.withLock {
+      val keepAlive = KeepAlive()
+      keepAlive.write(getTs(), socketId)
+      socket?.write(keepAlive)
     }
+  }
 
-    @Throws(IOException::class)
-    suspend fun reSendPackets(packetsLost: List<Int>, socket: SrtSocket?) {
-        // If the state is disabled, stop immediately
-        if (!stats.isRetransmissionEnabled.get()) return
-        writeSync.withLock {
-            val dataPackets = packetHandlingQueue.filter { packetsLost.contains(it.sequenceNumber) }
-            //Track how many we are about to write
-            stats.retransmittedPackets.addAndGet(dataPackets.size)
-            dataPackets.forEach { packet ->
-                packet.messageNumber = messageNumber++
-                packet.retransmitted = true
-                packet.write()
-                socket?.write(packet)
-            }
-        }
-    }
+  fun reset() {
+    sequenceNumber = generateInitialSequence()
+    messageNumber = 1
+    MTU = Constants.MTU
+    socketId = 0
+    startTS = 0L
+    host = ""
+    packetHandlingQueue.clear()
+  }
 
-    suspend fun updateHandlingQueue(lastPacketSequence: Int) {
-        writeSync.withLock {
-            packetHandlingQueue.removeAll { it.sequenceNumber < lastPacketSequence }
-        }
-    }
-
-    @Throws(IOException::class)
-    suspend fun writeAck2(ackSequence: Int, socket: SrtSocket?) {
-        writeSync.withLock {
-            val ack2 = Ack2(ackSequence)
-            ack2.write(getTs(), socketId)
-            socket?.write(ack2)
-        }
-    }
-
-    @Throws(IOException::class)
-    suspend fun writeShutdown(socket: SrtSocket?) {
-        writeSync.withLock {
-            val shutdown = Shutdown()
-            shutdown.write(getTs(), socketId)
-            socket?.write(shutdown)
-        }
-    }
-
-    @Throws(IOException::class)
-    suspend fun writeKeepAlive(socket: SrtSocket?) {
-        writeSync.withLock {
-            val keepAlive = KeepAlive()
-            keepAlive.write(getTs(), socketId)
-            socket?.write(keepAlive)
-        }
-    }
-
-    fun reset() {
-        sequenceNumber = generateInitialSequence()
-        messageNumber = 1
-        MTU = Constants.MTU
-        socketId = 0
-        startTS = 0L
-        host = ""
-        packetHandlingQueue.clear()
-    }
-
-    private fun generateInitialSequence(): Int {
-        return Random.nextInt(0, Int.MAX_VALUE)
-    }
+  private fun generateInitialSequence(): Int {
+    return Random.nextInt(0, Int.MAX_VALUE)
+  }
 }
