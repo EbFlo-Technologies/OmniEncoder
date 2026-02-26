@@ -139,4 +139,7 @@ class UdpStreamClient(
   override fun setSocketTimeout(timeout: Long) {
     udpClient.socketTimeout = timeout
   }
+    override fun setTargetBitrate(bitrateBps: Long) {
+    udpClient.setTargetBitrate(bitrateBps)
+    }
 }

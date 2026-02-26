@@ -99,7 +99,9 @@ class UdpClient(private val connectChecker: ConnectChecker) {
       }
     }
   }
-
+    fun setTargetBitrate(bitrateBps: Long) {
+        commandManager.setTargetBitrate(bitrateBps)
+    }
   fun setDelay(millis: Long) {
     udpSender.setDelay(millis)
   }

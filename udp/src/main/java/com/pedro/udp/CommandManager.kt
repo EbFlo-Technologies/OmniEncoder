@@ -20,6 +20,7 @@ import com.pedro.common.AudioCodec
 import com.pedro.common.VideoCodec
 import com.pedro.srt.mpeg2ts.MpegTsPacket
 import com.pedro.srt.utils.Constants
+import com.pedro.udp.utils.UdpPacketPacer
 import com.pedro.udp.utils.UdpSocket
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -38,16 +39,24 @@ class CommandManager {
   private val writeSync = Mutex(locked = false)
   var videoCodec = VideoCodec.H264
   var audioCodec = AudioCodec.AAC
-
-  @Throws(IOException::class)
-  suspend fun writeData(packet: MpegTsPacket, socket: UdpSocket?): Int {
-    writeSync.withLock {
-      return socket?.write(packet) ?: 0
+    // Initialize the pacer (defaults to 0, which bypasses pacing)
+    private val packetPacer = UdpPacketPacer(0L)
+    fun setTargetBitrate(bitrateBps: Long) {
+        // Add ~20% overhead to account for UDP/IP/MPEG-TS headers
+        packetPacer.updateBitrate((bitrateBps * 1.2).toLong())
     }
-  }
+    @Throws(IOException::class)
+    suspend fun writeData(packet: MpegTsPacket, socket: UdpSocket?): Int {
+        writeSync.withLock {
+            // Engage the pacer right before we pass the buffer to the socket
+            packetPacer.pace(packet.buffer.size)
+            return socket?.write(packet) ?: 0
+        }
+    }
 
-  fun reset() {
-    MTU = Constants.MTU
-    host = ""
-  }
+    fun reset() {
+        MTU = Constants.MTU
+        host = ""
+        packetPacer.updateBitrate(0L) // Reset pacing
+    }
 }

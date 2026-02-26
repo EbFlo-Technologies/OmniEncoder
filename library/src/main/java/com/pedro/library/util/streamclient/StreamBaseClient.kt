@@ -88,4 +88,5 @@ abstract class StreamBaseClient {
    * This will create a cache and wait the delay to start send packets in real time
    */
   abstract fun setDelay(millis: Long)
+  open fun setTargetBitrate(bitrateBps: Long) {}
 }
